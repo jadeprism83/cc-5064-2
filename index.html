@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>三角形覆盖规则验证渲染器 · MSAA 光栅调试视窗</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>三角形覆盖规则验证渲染器</h1>
+    <p class="sub">一致边函数 · 明确共享边归属（规范化绕序 + 顶/左谓词）· 精确 BigInt 定点 · 对象编号拾取 · 覆盖计数图 · MSAA 调试</p>
+  </div>
+  <div class="top-actions">
+    <span id="kernelBadge" class="badge">kernel: …</span>
+    <button id="runTestsBtn" class="primary">运行全部参考比对</button>
+  </div>
+</header>
+
+<section class="controlbar">
+  <div class="ctl-group">
+    <span class="ctl-label">采样数 / 图案</span>
+    <div id="sampleCountButtons" class="seg"></div>
+    <select id="patternSelect" title="子采样图案"></select>
+  </div>
+  <div class="ctl-group">
+    <span class="ctl-label">共边规则</span>
+    <select id="ruleSelect">
+      <option value="top-left">顶/左归属（正确，恰好一次）</option>
+      <option value="inclusive">全部含边（inclusive，演示双计）</option>
+      <option value="strict">严格内部（strict，演示漏边）</option>
+    </select>
+  </div>
+  <div class="ctl-group">
+    <span class="ctl-label">算术后端</span>
+    <select id="arithSelect">
+      <option value="auto">auto（安全时 float64 精确整数，否则 BigInt）</option>
+      <option value="big">强制 BigInt 精确</option>
+      <option value="number">强制 Number（仅调试）</option>
+    </select>
+  </div>
+  <div class="ctl-group">
+    <span class="ctl-label">拾取器</span>
+    <div class="seg" id="pickModeSeg">
+      <button data-mode="subsample" class="active">按指针子样本</button>
+      <button data-mode="area">按覆盖面积</button>
+    </div>
+  </div>
+  <div class="ctl-group">
+    <span class="ctl-label">绕序 / 顺序</span>
+    <button id="flipWindingBtn">翻转全部绕序</button>
+    <button id="orderReverseBtn">反转绘制顺序</button>
+    <button id="orderShuffleBtn">随机绘制顺序</button>
+    <button id="orderResetBtn">复位</button>
+  </div>
+</section>
+
+<main class="layout">
+  <div class="col-main">
+
+  <section class="panel scene-panel">
+    <div class="panel-head">
+      <h2>① 真实画面：可移动顶点的透明图元</h2>
+      <span class="hint">拖动圆点=移动顶点；在实体上拖动=移走整个对象；单击=放置探针/拾取</span>
+    </div>
+    <div class="scene-stage">
+      <div class="canvas-stack" id="sceneStack">
+        <canvas id="sceneCanvas" width="460" height="280"></canvas>
+        <canvas id="overlayCanvas" width="460" height="280"></canvas>
+      </div>
+    </div>
+    <div class="scene-side">
+      <div id="selectionInfo" class="selection-info">未选中对象</div>
+      <div class="btn-row">
+        <button id="moveAsideBtn">把选中物体移开</button>
+        <button id="hideSelectedBtn">隐藏/显示选中</button>
+        <button id="resetSceneBtn">复位场景</button>
+      </div>
+      <div class="policy-note" id="drawOrderInfo"></div>
+      <div class="legend" id="sceneLegend"></div>
+    </div>
+  </section>
+
+  <section class="panel count-panel">
+    <div class="panel-head"><h2>④ 覆盖计数图（每样本三角形贡献次数）</h2>
+      <label class="chk"><input type="checkbox" id="anomalyOnly" />只看异常</label>
+      <label class="chk"><input type="checkbox" id="countExcludeSelected" />排除选中对象</label>
+    </div>
+    <canvas id="countCanvas" width="460" height="280" class="count-canvas"></canvas>
+    <div id="countStats" class="count-stats"></div>
+    <div class="legend heat-legend">
+      <span><i class="sw" style="background:#1d2230"></i>0 未覆盖</span>
+      <span><i class="sw" style="background:#35d07f"></i>1 恰好一次</span>
+      <span><i class="sw" style="background:#ffb020"></i>2 双计</span>
+      <span><i class="sw" style="background:#ff4d5e"></i>≥3</span>
+    </div>
+  </section>
+
+  </div><!-- /.col-main -->
+
+  <div class="col-side">
+
+  <section class="panel id-panel">
+    <div class="panel-head"><h2>② 可点选对象编号缓冲</h2><span class="hint">点颜色块=把探针吸附到该样本</span></div>
+    <canvas id="idCanvas" width="460" height="280" class="id-canvas"></canvas>
+    <div class="legend" id="idLegend"></div>
+  </section>
+
+  <section class="panel inspector-panel">
+    <div class="panel-head"><h2>③ 取样检查器</h2><span class="hint">点放大格吸附样本；点空白处放自由探针</span></div>
+    <canvas id="inspectorCanvas" width="330" height="306" class="inspector-canvas"></canvas>
+    <div class="btn-row" style="margin:6px 0">
+      <button id="locateEdgeProbeBtn" class="primary">定位共边探测样本 (80.75, 90.25)</button>
+    </div>
+    <div id="probeCoords" class="mono"></div>
+    <div class="pick-results">
+      <div id="pickSubResult" class="pick-card"></div>
+      <div id="pickAreaResult" class="pick-card"></div>
+    </div>
+    <div id="sampleList" class="sample-list mono"></div>
+  </section>
+
+  </div><!-- /.col-side -->
+
+  <section class="panel lab-panel wide">
+    <div class="panel-head">
+      <h2>⑤ 多采样覆盖光栅调试视窗</h2>
+      <div class="lab-controls">
+        <select id="labPresetSelect">
+          <option value="shared-edge">共边双三角形（拾取分歧）</option>
+          <option value="single-edge">单条斜边</option>
+          <option value="thin">极薄三角形</option>
+          <option value="scenario:tiled-rects">参考：拼接矩形</option>
+          <option value="scenario:fan-grid">参考：扇形网格</option>
+          <option value="scenario:thin-tris">参考：极薄三角</option>
+          <option value="scenario:large-coords">参考：大坐标</option>
+        </select>
+        <label>边缘平移 X <input type="range" id="panX" min="-1" max="1" step="0.01" value="0" /><span id="panXVal" class="mono">0.00</span></label>
+        <label>Y <input type="range" id="panY" min="-1" max="1" step="0.01" value="0" /><span id="panYVal" class="mono">0.00</span></label>
+        <button id="panZeroBtn">平移归零</button>
+      </div>
+    </div>
+    <div id="labBanner" class="lab-banner ok"></div>
+    <div class="lab-body">
+      <canvas id="labCanvas" width="544" height="408" class="lab-canvas"></canvas>
+      <div class="lab-side">
+        <div id="labReadout" class="lab-readout mono"></div>
+        <h3>锯齿对比（同一平移量）</h3>
+        <div class="alias-row">
+          <div><canvas id="aliasOne" width="192" height="48"></canvas><p>1 样本中心</p></div>
+          <div><canvas id="aliasMany" width="192" height="48"></canvas><p id="aliasManyLabel">多采样解析</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel validation-panel wide">
+    <div class="panel-head">
+      <h2>⑥ 独立高精度参考比对（Python Fraction 生成）</h2>
+      <div>
+        <span id="testSummary" class="badge">尚未运行</span>
+        <button id="loadFirstFailureBtn" class="danger" hidden>把首个失败载入调试视窗</button>
+      </div>
+    </div>
+    <p class="hint">参考实现用独立的精确分数裁剪 + 鞋带公式计算解析面积，并逐样本给出对象编号/计数。下方卡片可把任意用例（含当前规则下的不变量失败）载入调试视窗。</p>
+    <div id="scenarioGrid" class="scenario-grid"></div>
+  </section>
+
+  <section class="panel docs-panel wide">
+    <div class="panel-head"><h2>数值、范围、退化政策与启动方式</h2></div>
+    <div class="docs-grid">
+      <div>
+        <h3>启动界面</h3>
+        <pre class="mono">cd /workspace
+python3 -m http.server 8123
+# 浏览器打开 http://localhost:8123/</pre>
+        <p class="hint">全部为无构建静态文件，直接双击 index.html 也可运行（参考数据已生成为 js/reference-data.js，不需要 fetch）。命令行测试：<code>npm test</code>；重新生成参考：<code>python3 tools/reference.py</code>。</p>
+      </div>
+      <div>
+        <h3>边函数与共享边归属</h3>
+        <p class="hint">W(A→B,P)=(B−A)×(P−A)。先把三角形规范化为 area2&gt;0，故翻转绕序结果不变。W&gt;0 在内；W=0 时仅当该规范边满足 <code>By&lt;Ay 或 (By=Ay 且 Bx&lt;Ax)</code>（向上边 / 水平从右向左的“顶/左”边）才收入。该谓词对 A/B 交换取反，因此共边样本恰好归属一个邻图元。</p>
+      </div>
+      <div>
+        <h3>范围与舍入</h3>
+        <p class="hint">坐标按 10<sup>-6</sup> px 量化为 BigInt 十进制定点，边函数为精确整数，无溢出、W=0 判定无误差。超过 6 位的十进制输入按 ties-to-even 舍入；number 输入先取其 float64 十进制值。算术后端 auto 会估计 |W| 上界，在增量乘积/步长均不超过 2<sup>53</sup>/2 时使用 float64 精确整数，否则强制 BigInt；测试强制两条后端逐样本一致。</p>
+      </div>
+      <div>
+        <h3>退化与深度政策</h3>
+        <p class="hint">area2=0（共线/重复顶点）标记 degenerate 且零覆盖；非有限坐标直接报错。覆盖/编号只由边规则与绘制顺序决定，不使用深度缓冲；共面等深度图元不会因 depth-compare 的偶然胜负掩盖共边双计。半透明在每样本上做 source-over 混合再平均解析，双计会同时体现在计数图与颜色上。</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">Coverage kernel: js/coverage-core.js · analytic: js/analytic.js · reference: tools/reference.py · 127 项 node:test 一致性检查</footer>
+
+<script src="js/coverage-core.js"></script>
+<script src="js/analytic.js"></script>
+<script src="js/reference-data.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

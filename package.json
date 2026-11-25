@@ -1,0 +1,16 @@
+{
+  "name": "triangle-coverage-validator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "三角形覆盖规则验证渲染器：一致边函数、共享边归属、MSAA 调试视窗与高精度参考比对",
+  "scripts": {
+    "test": "node --test test/core.test.cjs",
+    "test:ui": "node test/ui-smoke.cjs",
+    "test:all": "node --test test/core.test.cjs && node test/ui-smoke.cjs",
+    "reference": "python3 tools/reference.py",
+    "start": "python3 -m http.server 8123"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1"
+  }
+}
