@@ -25,6 +25,11 @@
   const DECIMALS = 6;
   const SCALE = 10n ** BigInt(DECIMALS);
 
+  const LEGACY_SAMPLE_LAYOUT_VERSION = 1;
+  const SAMPLE_LAYOUT_VERSION = 2;
+  const SAMPLE_LAYOUT_MIGRATION_VERSION = 'sample-layout-migration-v2-geometric-yx';
+  const CANONICAL_SAMPLE_ORDER = 'geometric-yx-v2';
+
   // ---------- 精确十进制定点 ----------
 
   function parseScaled(v) {
@@ -189,6 +194,173 @@
       y: parseScaled(s.y),
       raw: s,
     }));
+  }
+
+  function scaledOffsetToNumber(v) {
+    return Number(v) / Number(SCALE);
+  }
+
+  function samplePositionList(input, options = {}) {
+    let raw = input;
+    if (input && typeof input === 'object' && !Array.isArray(input)) {
+      raw = input.samplePositions || input.positions || input.samples ||
+        input.pattern || input.sampleLayout || input.layout;
+      if (raw && !Array.isArray(raw) && raw.positions) raw = raw.positions;
+      if (raw && !Array.isArray(raw) && raw.samples) raw = raw.samples;
+    }
+    const samples = normalizePattern(raw || options.defaultPattern || '4-grid');
+    return samples.map((s, index) => ({
+      ...s,
+      deviceIndex: index,
+      xn: scaledOffsetToNumber(s.x),
+      yn: scaledOffsetToNumber(s.y),
+    }));
+  }
+
+  function createSampleLayout(input, options = {}) {
+    const preserveOrder = options.preserveOrder === true || options.canonical === false;
+    let samples = samplePositionList(input, options);
+    if (!preserveOrder) {
+      samples = samples
+        .map((s, index) => ({ ...s, originalIndex: index }))
+        .sort((a, b) => (a.y < b.y ? -1 : a.y > b.y ? 1 :
+          a.x < b.x ? -1 : a.x > b.x ? 1 : a.originalIndex - b.originalIndex))
+        .map((s, index) => ({ ...s, geometricIndex: index }));
+    } else {
+      samples = samples.map((s, index) => ({ ...s, geometricIndex: index }));
+    }
+    return {
+      version: SAMPLE_LAYOUT_VERSION,
+      layoutVersion: SAMPLE_LAYOUT_VERSION,
+      migrationVersion: SAMPLE_LAYOUT_MIGRATION_VERSION,
+      interfaceVersion: 'sample-positions-v2',
+      order: preserveOrder ? (options.order || 'provided') : CANONICAL_SAMPLE_ORDER,
+      canonical: !preserveOrder,
+      sampleCount: samples.length,
+      N: samples.length,
+      samples,
+      positions: samples.map((s) => ({ x: s.xn, y: s.yn })),
+    };
+  }
+
+  const canonicalSampleLayout = (input, options = {}) =>
+    createSampleLayout(input, { ...options, canonical: true });
+
+  function sampleKey(s) {
+    return parseScaled(s.x).toString() + ',' + parseScaled(s.y).toString();
+  }
+
+  function sampleLayoutMapping(from, to, options = {}) {
+    const a = createSampleLayout(from, { canonical: false, ...options.fromOptions });
+    const b = createSampleLayout(to, { canonical: false, ...options.toOptions });
+    const N = a.sampleCount;
+    if (b.sampleCount !== N) {
+      throw new Error(`采样数量不一致：${N} -> ${b.sampleCount}`);
+    }
+
+    if (Array.isArray(options.oldToNew)) {
+      if (options.oldToNew.length !== N) throw new Error('oldToNew 映射长度与样本数不一致');
+      const oldToNew = Array.from(options.oldToNew, Number);
+      return finalizeMapping(oldToNew, N, 'reorder');
+    }
+
+    const newQueues = new Map();
+    b.samples.forEach((s, index) => {
+      const key = sampleKey(s);
+      if (!newQueues.has(key)) newQueues.set(key, []);
+      newQueues.get(key).push(index);
+    });
+    const oldToNew = new Array(N).fill(-1);
+    let exact = true;
+    a.samples.forEach((s, oldIndex) => {
+      const queue = newQueues.get(sampleKey(s));
+      if (queue && queue.length) oldToNew[oldIndex] = queue.shift();
+      else exact = false;
+    });
+
+    if (!exact || oldToNew.some((v) => v < 0)) {
+      return {
+        mode: 'shift',
+        reorder: false,
+        shifted: true,
+        exact: false,
+        sampleCount: N,
+        oldToNew: null,
+        newToOld: null,
+        identity: false,
+      };
+    }
+    return finalizeMapping(oldToNew, N, 'reorder');
+  }
+
+  function finalizeMapping(oldToNew, N, preferredMode) {
+    const seen = new Set();
+    for (const next of oldToNew) {
+      if (!Number.isInteger(next) || next < 0 || next >= N || seen.has(next)) {
+        throw new Error('采样映射必须是 0..N-1 的排列');
+      }
+      seen.add(next);
+    }
+    const newToOld = new Array(N);
+    oldToNew.forEach((next, oldIndex) => { newToOld[next] = oldIndex; });
+    const identity = oldToNew.every((v, i) => v === i);
+    return {
+      mode: identity ? 'identity' : preferredMode || 'reorder',
+      reorder: !identity,
+      shifted: false,
+      exact: true,
+      identity,
+      sampleCount: N,
+      oldToNew,
+      newToOld,
+    };
+  }
+
+  function remapSampleMask(mask, oldToNew) {
+    if (typeof mask === 'bigint') {
+      let out = 0n;
+      for (let k = 0; k < oldToNew.length; k++) {
+        if ((mask >> BigInt(k)) & 1n) out |= 1n << BigInt(oldToNew[k]);
+      }
+      return out;
+    }
+    let out = 0;
+    for (let k = 0; k < Math.min(32, oldToNew.length); k++) {
+      if ((Number(mask) >>> k) & 1) out |= (1 << oldToNew[k]) >>> 0;
+    }
+    return out >>> 0;
+  }
+
+  function decodeSampleMask(mask, N) {
+    const n = N || (typeof mask === 'bigint' ? mask.toString(2).length : 32);
+    const bits = [];
+    for (let k = 0; k < n; k++) {
+      const set = typeof mask === 'bigint'
+        ? Boolean((mask >> BigInt(k)) & 1n)
+        : Boolean((Number(mask) >>> k) & 1);
+      if (set) bits.push(k);
+    }
+    return bits;
+  }
+
+  function permutePerSampleArray(buffer, pixelCount, N, oldToNew, components = 1) {
+    if (!buffer) return buffer;
+    const length = pixelCount * N * components;
+    if (buffer.length !== length) {
+      throw new Error(`逐样本缓冲长度应为 ${length}，实际为 ${buffer.length}`);
+    }
+    const out = typeof buffer.slice === 'function' && buffer.BYTES_PER_ELEMENT
+      ? new buffer.constructor(buffer)
+      : new Array(length);
+    for (let p = 0; p < pixelCount; p++) {
+      for (let k = 0; k < N; k++) {
+        const j = oldToNew[k];
+        const oldBase = (p * N + k) * components;
+        const newBase = (p * N + j) * components;
+        for (let c = 0; c < components; c++) out[newBase + c] = buffer[oldBase + c];
+      }
+    }
+    return out;
   }
 
   // ---------- 三角形预处理 ----------
@@ -486,7 +658,16 @@
     const pixelCount = W * H;
     const owner = new Int32Array(pixelCount * N);
     const count = new Int16Array(pixelCount * N);
+    const visibleCount = new Int16Array(pixelCount * N);
     const sampleRGB = new Float32Array(pixelCount * N * 3);
+    const masks = new Uint32Array(pixelCount);
+    const visibleMasks = new Uint32Array(pixelCount);
+    const depthClear = opts.depthClear === undefined ? 1 : opts.depthClear;
+    const depth = new Float32Array(pixelCount * N);
+    depth.fill(depthClear);
+    const depthFunc = opts.depthFunc || (opts.depthTest ? 'lequal' : 'always');
+    const depthWrite = opts.depthWrite !== false;
+    let hitSamples = 0;
     for (let i = 0; i < pixelCount * N; i++) {
       sampleRGB[i * 3] = bg[0];
       sampleRGB[i * 3 + 1] = bg[1];
@@ -504,19 +685,34 @@
 
     const degenerates = [];
 
-    for (const { o } of order) {
+    for (const { o, i: originalIndex } of order) {
       const alpha = o.alpha === undefined ? 0.5 : o.alpha;
       const col = o.color || [220, 120, 200];
       const cr = col[0] / 255;
       const cg = col[1] / 255;
       const cb = col[2] / 255;
+      const objectDepth = Number.isFinite(o.depth) ? o.depth :
+        Number.isFinite(o.z) ? o.z :
+        Number.isFinite(opts.depth) ? opts.depth : 0.5;
+      void originalIndex;
       for (let t = 0; t < o.triangles.length; t++) {
         const prep = prepareTriangle(o.triangles[t], o.oid, t);
         if (prep.degenerate) { degenerates.push({ oid: o.oid, triIndex: t }); continue; }
         forEachHit(prep, patternQ, rule, vp, (lx, ly, k) => {
-          const sIdx = (ly * W + lx) * N + k;
+          const pIdx = ly * W + lx;
+          const sIdx = pIdx * N + k;
+          hitSamples++;
           count[sIdx]++;
-          owner[sIdx] = o.oid; // 后绘制者覆盖 ID
+          if (k < 32) masks[pIdx] |= (1 << k) >>> 0;
+
+          const z = Number.isFinite(prep.depth) ? prep.depth : objectDepth;
+          const depthPass = compareDepthFunc(z, depth[sIdx], depthFunc);
+          if (!depthPass) return;
+
+          visibleCount[sIdx]++;
+          if (k < 32) visibleMasks[pIdx] |= (1 << k) >>> 0;
+          if (depthWrite) depth[sIdx] = z;
+          owner[sIdx] = o.oid; // 深度/绘制顺序通过后，后绘制者覆盖 ID
           const i3 = sIdx * 3;
           sampleRGB[i3] = sampleRGB[i3] * (1 - alpha) + cr * 255 * alpha;
           sampleRGB[i3 + 1] = sampleRGB[i3 + 1] * (1 - alpha) + cg * 255 * alpha;
@@ -545,13 +741,47 @@
       coveredSamples[p] = cov;
     }
 
+    const samplePositions = patternQ.map((s) => ({ x: scaledOffsetToNumber(s.x), y: scaledOffsetToNumber(s.y) }));
+    const stats = {
+      triangles: order.reduce((n, e) => n + e.o.triangles.length, 0),
+      visibleObjects: order.length,
+      degenerates: degenerates.length,
+      hitSamples,
+      coveredPixels: Array.from(coveredSamples).filter((n) => n > 0).length,
+    };
+
     return {
       width: W, height: H, viewport: vp, N, rule,
+      version: SAMPLE_LAYOUT_VERSION,
+      storageVersion: SAMPLE_LAYOUT_VERSION,
+      sampleLayoutVersion: SAMPLE_LAYOUT_VERSION,
+      migrationVersion: SAMPLE_LAYOUT_MIGRATION_VERSION,
+      sampleOrder: 'provided',
       pattern: patternQ,
-      owner, count, sampleRGB,
+      samplePositions,
+      layout: createSampleLayout(patternQ, { canonical: false }),
+      owner, pickBuffer: owner, count, coverageCache: count,
+      visibleCount, sampleRGB, depth, depthBuffer: depth,
+      masks, sampleMasks: masks, coverageMasks: masks, visibleMasks,
       pixels, coverage, coveredSamples,
-      degenerates,
+      degenerates, stats,
     };
+  }
+
+  function compareDepthFunc(z, oldZ, func = 'always') {
+    switch (func) {
+      case 'always': return true;
+      case 'never': return false;
+      case 'less': return z < oldZ;
+      case 'lequal':
+      case 'less-equal': return z <= oldZ;
+      case 'equal': return z === oldZ;
+      case 'not-equal': return z !== oldZ;
+      case 'greater': return z > oldZ;
+      case 'gequal':
+      case 'greater-equal': return z >= oldZ;
+      default: throw new Error('未知深度比较函数 ' + func);
+    }
   }
 
   // 取某个局部像素内、按对象去重后的覆盖样本数（面积拾取的样本版本）。
@@ -624,13 +854,598 @@
     return bad;
   }
 
+  // ---------- 明确逐样本布局、缓冲迁移与新 MSAA 路径 ----------
+
+  const SAMPLE_BUFFER_COMPONENTS = {
+    owner: 1, pickBuffer: 1, pick: 1, pickSamples: 1,
+    depth: 1, depthBuffer: 1, sampleDepth: 1, z: 1,
+    count: 1, visibleCount: 1, coverageCache: 1, coverageSamples: 1, hits: 1,
+    sampleRGB: 3, sampleColors: 3, sampleColor: 3,
+  };
+  const PIXEL_ARRAY_NAMES = new Set([
+    'pixels', 'image', 'rgba', 'coverage', 'coveredSamples',
+    'masks', 'sampleMasks', 'coverageMasks', 'visibleMasks',
+  ]);
+
+  function storageViewport(storage) {
+    const vp = storage.viewport || {};
+    const width = storage.width || vp.width;
+    const height = storage.height || vp.height;
+    if (!width || !height) throw new Error('样本存储缺少 width/height');
+    return { x0: vp.x0 === undefined ? (storage.x0 || 0) : vp.x0,
+             y0: vp.y0 === undefined ? (storage.y0 || 0) : vp.y0,
+             width, height };
+  }
+
+  function storageSampleCount(storage, positions) {
+    if (positions) return createSampleLayout(positions, { canonical: false }).sampleCount;
+    return storage.sampleCount || storage.N ||
+      (storage.samplePositions && storage.samplePositions.length) ||
+      (storage.positions && storage.positions.length) ||
+      (storage.owner && storage.owner.length / (storage.width * storage.height)) ||
+      (storage.depth && storage.depth.length / (storage.width * storage.height)) ||
+      0;
+  }
+
+  function rasterMultisampleCoverage(scene, opts = {}) {
+    const requested = opts.samplePositions || opts.positions || opts.newSamplePositions ||
+      opts.layout || opts.sampleLayout || opts.pattern ||
+      (scene && scene.pattern) || '4-grid';
+    const canonical = opts.canonical !== false && opts.preserveOrder !== true;
+    const layout = createSampleLayout(requested, { canonical });
+    const raster = rasterScene(scene, {
+      ...opts,
+      pattern: layout.samples,
+      samplePositions: layout.positions,
+    });
+    raster.layout = layout;
+    raster.sampleLayout = layout;
+    raster.samplePositions = layout.positions;
+    raster.sampleOrder = layout.order;
+    raster.canonicalSamples = canonical;
+    raster.newPath = true;
+    raster.msaaImplementation = 'CoverageCore.rasterMultisampleCoverage';
+    raster.evidence = buildCoverageEvidence(raster, opts.evidencePoints || opts.points || []);
+    return raster;
+  }
+
+  function coverageEvidenceAt(raster, lx, ly) {
+    const { width: W, height: H, N, viewport: vp } = raster;
+    if (lx < 0 || ly < 0 || lx >= W || ly >= H) return null;
+    const p = ly * W + lx;
+    const mask = raster.masks ? raster.masks[p] >>> 0 : 0;
+    const visibleMask = raster.visibleMasks ? raster.visibleMasks[p] >>> 0 : mask;
+    const bits = decodeSampleMask(mask, N);
+    const owners = [];
+    const depths = [];
+    for (let k = 0; k < N; k++) {
+      const sIdx = p * N + k;
+      owners.push(raster.owner ? raster.owner[sIdx] : 0);
+      depths.push(raster.depth ? raster.depth[sIdx] : null);
+    }
+    const pick = pickStoredSample(raster, vp.x0 + lx + 0.5, vp.y0 + ly + 0.5);
+    return {
+      lx, ly,
+      x: vp.x0 + lx, y: vp.y0 + ly,
+      mask,
+      maskHex: '0x' + mask.toString(16).padStart(8, '0'),
+      maskBinary: mask.toString(2).padStart(N, '0'),
+      bits,
+      visibleMask,
+      visibleBits: decodeSampleMask(visibleMask, N),
+      coveredSamples: raster.coveredSamples ? raster.coveredSamples[p] : bits.length,
+      coverage: raster.coverage ? raster.coverage[p] : bits.length / N,
+      resolvedRGBA: raster.pixels ? Array.from(raster.pixels.slice(p * 4, p * 4 + 4)) : null,
+      owners,
+      depths,
+      pick,
+    };
+  }
+
+  function buildCoverageEvidence(raster, points = []) {
+    const vp = raster.viewport;
+    const pointEvidence = points.map((pt) => {
+      const lx = Math.floor(pt.x) - vp.x0;
+      const ly = Math.floor(pt.y) - vp.y0;
+      const evidence = coverageEvidenceAt(raster, lx, ly);
+      if (evidence) {
+        evidence.requested = { x: pt.x, y: pt.y };
+        evidence.pickAtPoint = pickStoredSample(raster, pt.x, pt.y);
+      }
+      return evidence;
+    }).filter(Boolean);
+    return {
+      schema: 'msaa-coverage-evidence-v1',
+      implementation: raster.msaaImplementation || 'CoverageCore.rasterMultisampleCoverage',
+      executed: true,
+      realDraw: true,
+      softwareRaster: true,
+      supersampled: false,
+      sampleCount: raster.N,
+      layoutVersion: raster.sampleLayoutVersion,
+      migrationVersion: raster.migrationVersion,
+      sampleOrder: raster.sampleOrder,
+      samplePositions: raster.samplePositions,
+      stats: raster.stats,
+      nonzeroMaskPixels: raster.masks ? Array.from(raster.masks).filter((m) => m !== 0).length : 0,
+      points: pointEvidence,
+    };
+  }
+
+  function resolveMsaaColor(colors, options = {}) {
+    const flat = [];
+    if (Array.isArray(colors) && colors.length && Array.isArray(colors[0])) {
+      for (const c of colors) flat.push(c[0], c[1], c[2]);
+    } else if (ArrayBuffer.isView(colors) || Array.isArray(colors)) {
+      flat.push(...colors);
+    }
+    const N = options.N || options.sampleCount || Math.floor(flat.length / 3);
+    const background = options.background || [0, 0, 0];
+    const mask = options.mask === undefined ? ((1 << Math.min(N, 31)) - 1) >>> 0 : options.mask;
+    const rule = options.resolveRule || options.rule || 'average';
+    let r = 0, g = 0, b = 0, denom = 0;
+    for (let k = 0; k < N; k++) {
+      const covered = k >= 32 ? true : Boolean((mask >>> k) & 1);
+      if (rule === 'covered-average' && !covered) continue;
+      denom++;
+      r += flat[k * 3] === undefined ? background[0] : flat[k * 3];
+      g += flat[k * 3 + 1] === undefined ? background[1] : flat[k * 3 + 1];
+      b += flat[k * 3 + 2] === undefined ? background[2] : flat[k * 3 + 2];
+    }
+    if (rule !== 'covered-average') denom = N;
+    const rgb = [r / denom, g / denom, b / denom];
+    const rgba = new Uint8ClampedArray([Math.round(rgb[0]), Math.round(rgb[1]), Math.round(rgb[2]), 255]);
+    return { rgb, rgba, color: Array.from(rgba), rule, mask: mask >>> 0 };
+  }
+  const resolveMaskColor = resolveMsaaColor;
+  const resolveSampleColor = resolveMsaaColor;
+  const resolveCoverageColor = resolveMsaaColor;
+
+  function pickStoredSample(storage, x, y, options = {}) {
+    const vp = storageViewport(storage);
+    const W = vp.width, H = vp.height;
+    const lx = Math.floor(x) - vp.x0;
+    const ly = Math.floor(y) - vp.y0;
+    const empty = { x, y, lx, ly, k: -1, sampleIndex: -1, oid: 0, storageIndex: -1 };
+    if (lx < 0 || ly < 0 || lx >= W || ly >= H) return empty;
+
+    const layout = createSampleLayout(
+      options.positions || storage.samplePositions || storage.positions ||
+      storage.layout || storage.sampleLayout || storage.pattern,
+      { canonical: false }
+    );
+    const N = layout.sampleCount;
+    const fx = x - (vp.x0 + lx);
+    const fy = y - (vp.y0 + ly);
+    let k = options.sampleIndex;
+    if (!Number.isInteger(k)) {
+      let best = Infinity;
+      for (let i = 0; i < N; i++) {
+        const dx = layout.positions[i].x - fx;
+        const dy = layout.positions[i].y - fy;
+        const d = dx * dx + dy * dy;
+        if (d < best) { best = d; k = i; }
+      }
+    }
+    const storageIndex = (ly * W + lx) * N + k;
+    const buffer = options.buffer || storage.pickBuffer || storage.owner || storage.pick;
+    const oid = buffer ? buffer[storageIndex] || 0 : 0;
+    return {
+      x, y, lx, ly, k, sampleIndex: k, storageIndex, oid,
+      samplePosition: layout.positions[k],
+    };
+  }
+  const pickFromSampleBuffer = pickStoredSample;
+
+  function canMigrateSampleStorage(storage, targetInput, options) {
+    try {
+      const normalized = normalizeMigrationArgs(storage, targetInput, options);
+      const { target, opts } = normalized;
+      const vp = storageViewport(storage);
+      const oldPositions = opts.from || opts.oldPositions || storage.samplePositions ||
+        storage.positions || (storage.layout && storage.layout.positions) ||
+        (storage.sampleLayout && storage.sampleLayout.positions) || storage.pattern;
+      if (!oldPositions && !opts.oldToNew) {
+        return {
+          canConvert: false, canPermute: false, requiresRasterization: true,
+          hasGeometry: hasMigrationGeometry(opts, storage),
+          decision: 'unknown-legacy-order',
+          reason: '旧存储未提供采样位置或 oldToNew 映射，无法确定设备样本序号',
+        };
+      }
+      const mapping = opts.oldToNew
+        ? sampleLayoutMapping(oldPositions || target, target || oldPositions, { oldToNew: opts.oldToNew })
+        : sampleLayoutMapping(oldPositions, target, opts);
+      const hasGeometry = hasMigrationGeometry(opts, storage);
+      if (mapping.mode !== 'shift') {
+        return { canConvert: true, canPermute: true, requiresRasterization: false, mapping, vp };
+      }
+      return {
+        canConvert: hasGeometry,
+        canPermute: false,
+        requiresRasterization: true,
+        hasGeometry,
+        decision: hasGeometry ? 'rerasterize' : (opts.strategy === 'preserve' ? 'preserve' : 'reject'),
+        reason: hasGeometry ? '采样点真正移位，使用原几何重新光栅化' :
+          '采样点真正移位；没有原三角形时旧位图不能确定新样本位于斜边哪一侧',
+        mapping, vp,
+      };
+    } catch (error) {
+      return { canConvert: false, canPermute: false, error: error.message, decision: 'reject' };
+    }
+  }
+
+  function hasMigrationGeometry(options, storage) {
+    return Boolean(
+      options.geometry || options.objects || options.scene || options.triangles ||
+      storage.geometry || storage.objects || storage.scene
+    );
+  }
+
+  function migrationTargetFromOptions(options = {}) {
+    return options.target || options.to || options.newSamplePositions ||
+      options.samplePositions || options.positions || options.newPositions ||
+      options.targetPositions || options.newLayout || options.layout;
+  }
+
+  function normalizeMigrationArgs(storage, targetInput, maybeOptions) {
+    let target = targetInput;
+    let options = maybeOptions || {};
+    if (targetInput && !Array.isArray(targetInput) &&
+        !(typeof targetInput === 'string') && maybeOptions === undefined) {
+      options = targetInput;
+      target = migrationTargetFromOptions(options);
+    }
+    if (!target && options.canonical !== false) {
+      target = migrationTargetFromOptions(options);
+    }
+    return { target, opts: options };
+  }
+
+  function migrateSampleConfig(config = {}, targetInput, maybeOptions) {
+    const { target, opts } = normalizeMigrationArgs(config, targetInput, maybeOptions || {});
+    const positions = target ? createSampleLayout(target, { canonical: opts.canonical !== false }) : null;
+    return {
+      ...config,
+      storageVersion: SAMPLE_LAYOUT_VERSION,
+      sampleLayoutVersion: SAMPLE_LAYOUT_VERSION,
+      migrationVersion: SAMPLE_LAYOUT_MIGRATION_VERSION,
+      sampleLayout: positions || config.sampleLayout || CANONICAL_SAMPLE_ORDER,
+      samplePositions: positions ? positions.positions : config.samplePositions,
+      sampleCount: positions ? positions.sampleCount : (config.sampleCount || config.N),
+      // 只迁移存储身份，不改变配置声明的解析规则；也不把 MSAA 替换成超大纹理。
+      resolveRule: config.resolveRule || config.resolve || config.resolutionRule || 'average',
+      declaredResolveRule: config.resolveRule || config.resolve || config.resolutionRule || 'average',
+      supersample: false,
+      oversizedTextureReplacement: false,
+    };
+  }
+
+  function migrateSampleStorage(storage, targetInput, maybeOptions) {
+    const { target: explicitTarget, opts } = normalizeMigrationArgs(storage, targetInput, maybeOptions);
+    const vp = storageViewport(storage);
+    const pixelCount = vp.width * vp.height;
+    const oldPositions = opts.from || opts.oldPositions || storage.samplePositions ||
+      storage.positions || (storage.layout && storage.layout.positions) ||
+      (storage.sampleLayout && storage.sampleLayout.positions) || storage.pattern;
+    const target = explicitTarget || migrationTargetFromOptions(opts) ||
+      (opts.canonical !== false && oldPositions ? canonicalSampleLayout(oldPositions) : null);
+
+    if (!oldPositions && !opts.oldToNew) {
+      const error = new Error('旧 MSAA 存储缺少 samplePositions/oldToNew，无法把设备序号迁移到几何编号');
+      error.code = 'SAMPLE_LAYOUT_UNKNOWN_LEGACY_ORDER';
+      error.decision = 'reject';
+      throw error;
+    }
+    if (!target && !opts.oldToNew) {
+      const error = new Error('采样布局迁移需要目标 samplePositions');
+      error.code = 'SAMPLE_LAYOUT_TARGET_REQUIRED';
+      throw error;
+    }
+
+    const N = storageSampleCount(storage, oldPositions || target);
+    const mapping = opts.oldToNew
+      ? finalizeMapping(Array.from(opts.oldToNew, Number), N, 'reorder')
+      : sampleLayoutMapping(oldPositions, target, opts);
+
+    if (mapping.mode === 'shift') {
+      return migrateShiftedSampleStorage(storage, target, opts, mapping);
+    }
+
+    const out = { ...storage };
+    for (const [key, components] of Object.entries(SAMPLE_BUFFER_COMPONENTS)) {
+      if (out[key] && out[key].length === pixelCount * N * components) {
+        out[key] = permutePerSampleArray(out[key], pixelCount, N, mapping.oldToNew, components);
+      }
+    }
+    for (const [key, value] of Object.entries(out)) {
+      if (PIXEL_ARRAY_NAMES.has(key) || SAMPLE_BUFFER_COMPONENTS[key]) continue;
+      if (!value || typeof value.length !== 'number') continue;
+      if (value.length === pixelCount * N) {
+        out[key] = permutePerSampleArray(value, pixelCount, N, mapping.oldToNew, 1);
+      } else if (value.length === pixelCount * N * 3 && !/pixel|rgba|image/i.test(key)) {
+        out[key] = permutePerSampleArray(value, pixelCount, N, mapping.oldToNew, 3);
+      }
+    }
+    for (const key of ['masks', 'sampleMasks', 'coverageMasks', 'visibleMasks', 'sampleMask']) {
+      const masks = out[key];
+      if (typeof masks === 'number' || typeof masks === 'bigint') {
+        out[key] = remapSampleMask(masks, mapping.oldToNew);
+      } else if (masks && typeof masks.length === 'number') {
+        const remappedMasks = masks.slice();
+        for (let p = 0; p < remappedMasks.length; p++) {
+          if (typeof remappedMasks[p] === 'number' || typeof remappedMasks[p] === 'bigint') {
+            remappedMasks[p] = remapSampleMask(remappedMasks[p], mapping.oldToNew);
+          }
+        }
+        out[key] = remappedMasks;
+      }
+    }
+
+    const BUFFER_ALIAS_GROUPS = [
+      ['owner', 'pickBuffer', 'pick', 'pickSamples'],
+      ['depth', 'depthBuffer', 'sampleDepth', 'z'],
+      ['count', 'coverageCache', 'coverageSamples', 'hits'],
+      ['masks', 'sampleMasks', 'coverageMasks'],
+    ];
+    for (const keys of BUFFER_ALIAS_GROUPS) {
+      const baseKey = keys.find((key) => storage[key]);
+      if (!baseKey) continue;
+      for (const key of keys) {
+        if (key !== baseKey && storage[key] === storage[baseKey]) out[key] = out[baseKey];
+      }
+    }
+
+    const targetLayout = (target || oldPositions)
+      ? createSampleLayout(target || oldPositions, { canonical: false })
+      : {
+        version: SAMPLE_LAYOUT_VERSION,
+        layoutVersion: SAMPLE_LAYOUT_VERSION,
+        migrationVersion: SAMPLE_LAYOUT_MIGRATION_VERSION,
+        order: options.targetOrder || CANONICAL_SAMPLE_ORDER,
+        sampleCount: N,
+        N,
+        positions: null,
+        samples: [],
+        mappingOnly: true,
+      };
+    out.samplePositions = targetLayout.positions;
+    out.layout = targetLayout;
+    out.sampleLayout = targetLayout;
+    out.sampleOrder = targetLayout.order;
+    out.sampleCount = N;
+    out.N = N;
+    out.storageVersion = SAMPLE_LAYOUT_VERSION;
+    out.sampleLayoutVersion = SAMPLE_LAYOUT_VERSION;
+    out.migrationVersion = SAMPLE_LAYOUT_MIGRATION_VERSION;
+    out.migrated = !mapping.identity;
+    out.changed = !mapping.identity;
+    out.mode = mapping.identity ? 'identity' : 'reorder';
+    out.decision = 'permute';
+    out.mapping = mapping;
+    out.oldToNew = mapping.oldToNew;
+    out.newToOld = mapping.newToOld;
+    out.ok = true;
+    Object.defineProperty(out, 'storage', { value: out, enumerable: false });
+    return out;
+  }
+
+  function migrateShiftedSampleStorage(storage, target, options, mapping) {
+    const geometry = options.geometry ||
+      (options.scene && options.scene.objects) ||
+      options.objects ||
+      (Array.isArray(options.geometry) ? options.geometry : null) ||
+      (options.geometry && options.geometry.objects) ||
+      storage.objects ||
+      (storage.scene && storage.scene.objects);
+
+    let objects = geometry;
+    if (!objects && options.triangles) {
+      objects = [{
+        oid: options.oid || 1,
+        color: options.color || [74, 144, 255],
+        alpha: options.alpha === undefined ? 1 : options.alpha,
+        triangles: options.triangles,
+      }];
+    }
+
+    if (objects) {
+      const vp = options.viewport || storage.viewport || {
+        x0: storage.x0 || 0, y0: storage.y0 || 0,
+        width: storage.width, height: storage.height,
+      };
+      const raster = rasterMultisampleCoverage(
+        { objects },
+        {
+          samplePositions: target,
+          viewport: vp,
+          rule: options.rule || storage.rule || 'top-left',
+          arith: options.arith || 'auto',
+          background: options.background || storage.background,
+          depthFunc: options.depthFunc || storage.depthFunc,
+          evidencePoints: options.evidencePoints || [],
+          canonical: false,
+        }
+      );
+      raster.mode = 'rerasterize';
+      raster.decision = 'rerasterize';
+      raster.changed = true;
+      raster.migrated = true;
+      raster.mapping = mapping;
+      raster.ok = true;
+      raster.migrationVersion = SAMPLE_LAYOUT_MIGRATION_VERSION;
+      Object.defineProperty(raster, 'storage', { value: raster, enumerable: false });
+      return raster;
+    }
+
+    const strategy = options.withoutGeometry || options.onMissingGeometry ||
+      (options.preserveLegacy || options.allowPreserveLegacy || options.keepLegacy ? 'preserve' : options.strategy) ||
+      'reject';
+    if (strategy === 'preserve' || strategy === 'preserve-legacy') {
+      const preserved = {
+        ...storage,
+        migrated: false,
+        changed: false,
+        converted: false,
+        preservedLegacy: true,
+        mode: 'preserve-legacy',
+        decision: 'preserve',
+        ok: true,
+        canConvert: false,
+        sampleLayoutVersion: storage.sampleLayoutVersion || LEGACY_SAMPLE_LAYOUT_VERSION,
+        storageVersion: storage.storageVersion || LEGACY_SAMPLE_LAYOUT_VERSION,
+        migrationWarning: '采样点已移位且无几何；保留旧设备布局，未声称完成迁移',
+        mapping,
+      };
+      Object.defineProperty(preserved, 'storage', { value: preserved, enumerable: false });
+      return preserved;
+    }
+
+    const error = new Error('采样点真正移位且缺少原三角形/场景几何；旧位图不足以重新判定新样本覆盖');
+    error.code = 'SAMPLE_LAYOUT_GEOMETRY_REQUIRED';
+    error.decision = 'reject';
+    error.mapping = mapping;
+    throw error;
+  }
+
+  function adaptSamplePositionBackend(backend, next, options = {}) {
+    if (backend && typeof backend.setSamplePositions === 'function') {
+      return backend.setSamplePositions(next, options);
+    }
+    const adapted = createSamplePositionBackend({
+      ...(backend || {}),
+      samplePositions: next,
+    });
+    if (backend && typeof backend === 'object') {
+      for (const [key, value] of Object.entries(backend)) {
+        if (!(key in adapted)) adapted[key] = value;
+      }
+    }
+    return adapted;
+  }
+
+  function createSamplePositionBackend(options = {}) {
+    let layout = canonicalSampleLayout(
+      options.samplePositions || options.positions || options.pattern || '4-grid'
+    );
+    const backend = {
+      interfaceVersion: 'sample-positions-v2',
+      migrationVersion: SAMPLE_LAYOUT_MIGRATION_VERSION,
+      version: SAMPLE_LAYOUT_VERSION,
+      getSampleLayout() { return layout; },
+      getSamplePositions() { return layout.positions; },
+      setSamplePositions(next, setOptions = {}) {
+        const previous = layout;
+        const nextLayout = createSampleLayout(next, {
+          canonical: setOptions.canonical !== false,
+        });
+        let change;
+        if (previous.sampleCount !== nextLayout.sampleCount) {
+          change = {
+            mode: 'count-change',
+            countChanged: true,
+            reorder: false,
+            shifted: true,
+            exact: false,
+            oldSampleCount: previous.sampleCount,
+            sampleCount: nextLayout.sampleCount,
+            oldToNew: null,
+            newToOld: null,
+          };
+        } else {
+          change = sampleLayoutMapping(previous, nextLayout, setOptions);
+        }
+        layout = nextLayout;
+        return change;
+      },
+      rasterScene(scene, rasterOptions = {}) {
+        return rasterMultisampleCoverage(scene, {
+          ...options, ...rasterOptions, samplePositions: layout.positions, canonical: false,
+        });
+      },
+      migrateStorage(storage, migrationOptions = {}) {
+        return migrateSampleStorage(storage, layout.positions, migrationOptions);
+      },
+      pick(storage, x, y, pickOptions = {}) {
+        return pickStoredSample(storage, x, y, { positions: layout.positions, ...pickOptions });
+      },
+    };
+    return backend;
+  }
+  const SamplePositionBackend = function SamplePositionBackend(options) {
+    return createSamplePositionBackend(options);
+  };
+
+  const BIGINT_JSON_MARKER = '__bigint__';
+
+  function serializeSampleStorage(storage) {
+    const replacer = (_key, value) => {
+      if (typeof value === 'bigint') return { [BIGINT_JSON_MARKER]: value.toString() };
+      if (ArrayBuffer.isView(value) && typeof value.length === 'number') return Array.from(value);
+      return value;
+    };
+    return JSON.stringify(storage, replacer, 2);
+  }
+
+  function deserializeSampleStorage(raw) {
+    if (typeof raw !== 'string') return raw;
+    return JSON.parse(raw, (_key, value) => {
+      if (value && typeof value === 'object' &&
+          Object.prototype.hasOwnProperty.call(value, BIGINT_JSON_MARKER) &&
+          Object.keys(value).length === 1) {
+        return BigInt(value[BIGINT_JSON_MARKER]);
+      }
+      return value;
+    });
+  }
+
   return {
     DECIMALS,
     SCALE,
     PATTERNS,
+    LEGACY_SAMPLE_LAYOUT_VERSION,
+    SAMPLE_LAYOUT_VERSION,
+    SAMPLE_LAYOUT_SCHEMA_VERSION: SAMPLE_LAYOUT_VERSION,
+    SAMPLE_SCHEMA_VERSION: SAMPLE_LAYOUT_VERSION,
+    MSAA_LAYOUT_VERSION: SAMPLE_LAYOUT_VERSION,
+    SAMPLE_LAYOUT_MIGRATION_VERSION,
+    MIGRATION_VERSION: SAMPLE_LAYOUT_MIGRATION_VERSION,
+    CANONICAL_SAMPLE_ORDER,
+    GEOMETRIC_SAMPLE_ORDER: CANONICAL_SAMPLE_ORDER,
     parseScaled,
     parseScaledString,
     normalizePattern,
+    createSampleLayout,
+    canonicalSampleLayout,
+    sampleLayoutMapping,
+    remapSampleMask,
+    decodeSampleMask,
+    permutePerSampleArray,
+    migrateSampleConfig,
+    migrateSampleStorage,
+    migrateSampleLayout: migrateSampleStorage,
+    migrateMultisampleStorage: migrateSampleStorage,
+    migrateMsaaStorage: migrateSampleStorage,
+    migrateCoverageStorage: migrateSampleStorage,
+    migrateCoverageLayout: migrateSampleStorage,
+    migrateSampleBuffers: migrateSampleStorage,
+    migrateDepthAndPickBuffers: migrateSampleStorage,
+    canMigrateSampleStorage,
+    rasterMultisampleCoverage,
+    coverageEvidenceAt,
+    buildCoverageEvidence,
+    resolveMsaaColor,
+    resolveMaskColor,
+    resolveSampleColor,
+    resolveCoverageColor,
+    pickStoredSample,
+    pickFromSampleBuffer,
+    createSamplePositionBackend,
+    adaptSamplePositionBackend,
+    SamplePositionBackend,
+    serializeSampleStorage,
+    deserializeSampleStorage,
+    compareDepthFunc,
     prepareTriangle,
     edgeValuesAt,
     pointInside,

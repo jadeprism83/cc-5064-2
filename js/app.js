@@ -213,7 +213,7 @@
     renderInspector(objs);
     renderCount(objs);
     renderLab();
-    renderAliasing();
+    safeRenderAliasing();
     updateSelectionInfo();
   }
 
@@ -804,18 +804,18 @@
     $('panX').addEventListener('input', (e) => {
       state.lab.panX = Number(e.target.value);
       $('panXVal').textContent = state.lab.panX.toFixed(2);
-      renderLab(); renderAliasing();
+      renderLab(); safeRenderAliasing();
     });
     $('panY').addEventListener('input', (e) => {
       state.lab.panY = Number(e.target.value);
       $('panYVal').textContent = state.lab.panY.toFixed(2);
-      renderLab(); renderAliasing();
+      renderLab(); safeRenderAliasing();
     });
     $('panZeroBtn').addEventListener('click', () => {
       state.lab.panX = 0; state.lab.panY = 0;
       $('panX').value = 0; $('panY').value = 0;
       $('panXVal').textContent = '0.00'; $('panYVal').textContent = '0.00';
-      renderLab(); renderAliasing();
+      renderLab(); safeRenderAliasing();
     });
 
     els.labCanvas.addEventListener('pointerdown', (e) => {
@@ -880,7 +880,36 @@
     return { objects: objs, vp: state.lab.presets[state.lab.presetId].viewport, scenario: null };
   }
 
+  function reportMsaaError(err) {
+    const banner = $('labBanner');
+    if (banner) {
+      banner.className = 'lab-banner fail';
+      banner.textContent = '多采样覆盖界面捕获到执行异常：' + (err && err.message ? err.message : String(err));
+    }
+    const out = $('labReadout');
+    if (out) out.textContent = (err && err.stack) ? err.stack : String(err);
+    const evidence = $('msaaEvidence');
+    if (evidence) evidence.textContent = 'MSAA evidence unavailable: ' + (err && err.message ? err.message : String(err));
+    if (window) window.__msaaCoverageError = err;
+  }
+
   function renderLab() {
+    try {
+      renderLabContent();
+    } catch (err) {
+      reportMsaaError(err);
+    }
+  }
+
+  function safeRenderAliasing() {
+    try {
+      renderAliasing();
+    } catch (err) {
+      reportMsaaError(err);
+    }
+  }
+
+  function renderLabContent() {
     const canvas = els.labCanvas, ctx = lctx;
     const info = labObjectsDisplay();
     const vp = info.vp;
@@ -898,11 +927,18 @@
     ctx.fillStyle = '#0b0e15';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    const pat = patternRaw();
-    const lr = Core.rasterScene(
-      { objects: info.objects },
-      { pattern: pat, viewport: vp, rule: state.rule, arith: state.arith }
-    );
+    const rawPat = patternRaw();
+    const rasterOptions = {
+      pattern: rawPat,
+      viewport: vp,
+      rule: state.rule,
+      arith: state.arith,
+      evidencePoints: [state.lab.probe],
+    };
+    const lr = typeof Core.rasterMultisampleCoverage === 'function'
+      ? Core.rasterMultisampleCoverage({ objects: info.objects }, { ...rasterOptions, canonical: true })
+      : Core.rasterScene({ objects: info.objects }, rasterOptions);
+    const pat = lr.samplePositions || rawPat;
 
     // 解析后的像素底图（离屏放大）
     const off = document.createElement('canvas');
@@ -995,6 +1031,25 @@
         try { area = An.objectPixelArea(o, px, py); } catch (e) { area = NaN; }
         txt += `#${o.oid} ${shortName(o.name || '')}: 样本 ${samples}/${pat.length}  解析面积 ${area.toFixed(4)}\n`;
       }
+
+      if (Core.coverageEvidenceAt) {
+        const ev = Core.coverageEvidenceAt(lr, px - info.vp.x0, py - info.vp.y0);
+        if (ev) {
+          const edgePick = Core.pickStoredSample ? Core.pickStoredSample(lr, pr.x, pr.y) : ev.pick;
+          txt += `\n逐样本布局: v${lr.sampleLayoutVersion || Core.SAMPLE_LAYOUT_VERSION} ${lr.sampleOrder || 'provided'}`;
+          txt += `\n样本掩码: ${ev.maskBinary} (${ev.maskHex})  覆盖 ${ev.coveredSamples}/${lr.N}`;
+          txt += `\n解析颜色: rgba(${ev.resolvedRGBA.join(',')})`;
+          txt += `\n拾取缓冲: #${edgePick.oid} @sample ${edgePick.k}（几何位置编号）`;
+          state.lab.lastEvidence = { ...ev, pickAtPoint: edgePick };
+          const evidenceEl = $('msaaEvidence');
+          if (evidenceEl) {
+            evidenceEl.textContent =
+              `mask=${ev.maskBinary} hex=${ev.maskHex} resolve=rgba(${ev.resolvedRGBA.join(',')}) ` +
+              `pick=#${edgePick.oid}:${edgePick.k} layout=v${lr.sampleLayoutVersion}:${lr.sampleOrder}`;
+          }
+          if (window) window.__msaaCoverageEvidence = state.lab.lastEvidence;
+        }
+      }
     }
     txt += `\n重复命中样本: ${multi.length}`;
     if (multi.length) txt += `  首例 @(${multi[0].x},${multi[0].y}) k=${multi[0].k} count=${multi[0].count}`;
@@ -1004,11 +1059,21 @@
     let refMismatch = null;
     if (info.scenario && info.scenario.rasters[state.patternId] && state.rule === 'top-left') {
       const ref = info.scenario.rasters[state.patternId];
+      let oldToNew = null;
+      try {
+        oldToNew = Core.sampleLayoutMapping(REF.patterns[state.patternId], lr.samplePositions || pat).oldToNew;
+      } catch (e) { oldToNew = null; }
+      const pixels = ref.counts.length / ref.N;
       let bad = 0, first = null;
-      for (let i = 0; i < ref.counts.length; i++) {
-        if (lr.count[i] !== ref.counts[i] || lr.owner[i] !== ref.owners[i]) {
-          bad++;
-          if (!first) first = i;
+      for (let p = 0; p < pixels; p++) {
+        for (let oldK = 0; oldK < ref.N; oldK++) {
+          const newK = oldToNew ? oldToNew[oldK] : oldK;
+          const refIndex = p * ref.N + oldK;
+          const gotIndex = p * lr.N + newK;
+          if (lr.count[gotIndex] !== ref.counts[refIndex] || lr.owner[gotIndex] !== ref.owners[refIndex]) {
+            bad++;
+            if (!first) first = gotIndex;
+          }
         }
       }
       refMismatch = bad;
@@ -1030,8 +1095,8 @@
     } else {
       banner.className = multi.length ? 'lab-banner fail' : 'lab-banner ok';
       banner.textContent = multi.length
-        ? `失败：检测到 ${multi.length} 个重复命中样本。`
-        : '不变量成立：共边样本恰好归属一次，无重复贡献。可拖动顶点或平移边缘验证。';
+        ? `失败：新逐样本布局路径检测到 ${multi.length} 个重复命中样本。`
+        : `通过：光栅调试视窗已调用 MSAA 新实现（布局 v${lr.sampleLayoutVersion || 2}），样本掩码/解析颜色与拾取证据已列出，共边样本恰好归属一次。`;
     }
     $('labReadout').textContent = txt;
     return { multi: multi.length, refMismatch };
@@ -1052,9 +1117,10 @@
     const W2 = 96, H2 = 24;
     for (const [canvas, pattern] of [[els.aliasOne, '1-center'], [els.aliasMany, state.patternId]]) {
       if (canvas.width !== W2) { canvas.width = W2; canvas.height = H2; }
-      const r = Core.rasterScene(
+      const rasterMsaa = Core.rasterMultisampleCoverage || Core.rasterScene;
+      const r = rasterMsaa(
         { objects: stripObjects(), background: [255, 255, 255] },
-        { pattern, viewport: { x0: 0, y0: 0, width: W2, height: H2 }, rule: state.rule, arith: state.arith }
+        { pattern, viewport: { x0: 0, y0: 0, width: W2, height: H2 }, rule: state.rule, arith: state.arith, canonical: false }
       );
       // 白色背景到深蓝前景，按覆盖率线性混合，直观看锯齿与 MSAA 平滑
       const ctx = canvas.getContext('2d');

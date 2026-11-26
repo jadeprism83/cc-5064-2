@@ -126,6 +126,7 @@ select { max-width: 330px; }
 .lab-banner.fail { background: #3d161c; border-color: var(--bad); color: #ffd7db; }
 .lab-banner.info { background: #10233d; border-color: #1f5a9e; color: #cfe6ff; }
 .lab-readout { background: #0b0e15; border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font-size: 12px; white-space: pre-wrap; min-height: 150px; }
+.msaa-evidence { margin: 8px 0; padding: 8px 9px; border: 1px solid #244c7a; border-radius: 8px; background: #0d1828; color: #b9dcff; font-size: 11px; overflow-wrap: anywhere; }
 .alias-row { display: flex; gap: 14px; flex-wrap: wrap; }
 .alias-row canvas {
   width: 192px; height: 48px; image-rendering: pixelated; border: 1px solid var(--line); border-radius: 6px; background: #fff;

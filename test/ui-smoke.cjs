@@ -108,6 +108,39 @@ function assert(cond, msg) {
   await sleep(80);
   assert(b8.classList.contains('active'), '8x 按钮激活');
   assert(/8/.test($('aliasManyLabel').textContent), '锯齿标签更新为 8×：' + $('aliasManyLabel').textContent);
+  assert(/mask=[01]+/.test($('msaaEvidence').textContent), 'MSAA 证据显示真实样本掩码：' + $('msaaEvidence').textContent);
+  assert(/resolve=rgba\(/.test($('msaaEvidence').textContent), 'MSAA 证据显示解析颜色');
+  assert(/pick=#\d+:\d+/.test($('msaaEvidence').textContent), 'MSAA 证据显示拾取缓冲样本');
+  assert(/layout=v2:geometric-yx-v2/.test($('msaaEvidence').textContent), 'MSAA 证据标注几何布局 v2');
+  assert(window.__msaaCoverageEvidence && Array.isArray(window.__msaaCoverageEvidence.resolvedRGBA),
+    'window 暴露可执行的 MSAA 覆盖证据');
+
+  const evidenceBeforePan = $('msaaEvidence').textContent;
+  const panX = $('panX');
+  panX.value = '0.35';
+  panX.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await sleep(80);
+  assert($('panXVal').textContent === '0.35', '边缘平移 X 控件更新：' + $('panXVal').textContent);
+  assert(/mask=[01]+/.test($('msaaEvidence').textContent), '平移边缘后 MSAA 覆盖证据仍更新');
+  assert($('msaaEvidence').textContent !== evidenceBeforePan, '平移边缘后样本掩码/解析/拾取证据发生变化');
+  assert(/8× MSAA 解析/.test($('aliasManyLabel').textContent), '平移边缘后锯齿对比仍按当前采样数运算');
+  $('panZeroBtn').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await sleep(80);
+  assert($('panXVal').textContent === '0.00', '平移归零恢复控件状态');
+
+  const originalMsaaRaster = window.CoverageCore.rasterMultisampleCoverage;
+  window.CoverageCore.rasterMultisampleCoverage = () => { throw new Error('注入 MSAA 异常'); };
+  panX.value = '0.41';
+  panX.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await sleep(80);
+  assert(/注入 MSAA 异常/.test($('labBanner').textContent), 'MSAA 计算异常显示在多采样覆盖界面');
+  assert(/MSAA evidence unavailable/.test($('msaaEvidence').textContent), 'MSAA 证据区同步提示异常');
+  assert(window.__msaaCoverageError && /注入 MSAA 异常/.test(window.__msaaCoverageError.message),
+    'MSAA 异常被记录到界面状态');
+  window.CoverageCore.rasterMultisampleCoverage = originalMsaaRaster;
+  $('panZeroBtn').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await sleep(80);
+  assert(/ok/.test($('labBanner').className), '移除故障后 MSAA 视窗可恢复正常');
 
   // 移开按钮
   $('moveAsideBtn').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));

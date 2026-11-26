@@ -146,6 +146,7 @@
       <canvas id="labCanvas" width="544" height="408" class="lab-canvas"></canvas>
       <div class="lab-side">
         <div id="labReadout" class="lab-readout mono"></div>
+        <div id="msaaEvidence" class="msaa-evidence mono" data-testid="msaa-evidence">MSAA 证据尚未执行</div>
         <h3>锯齿对比（同一平移量）</h3>
         <div class="alias-row">
           <div><canvas id="aliasOne" width="192" height="48"></canvas><p>1 样本中心</p></div>
@@ -178,6 +179,10 @@ python3 -m http.server 8123
         <p class="hint">全部为无构建静态文件，直接双击 index.html 也可运行（参考数据已生成为 js/reference-data.js，不需要 fetch）。命令行测试：<code>npm test</code>；重新生成参考：<code>python3 tools/reference.py</code>。</p>
       </div>
       <div>
+        <h3>多采样覆盖：图形入口与布局迁移</h3>
+        <p class="hint">图形主入口是本页 <strong>⑤ 多采样覆盖光栅调试视窗</strong>：选择采样数/非中心图案、平移边缘或拖动顶点后，会真实执行逐样本光栅，并在右侧给出样本掩码、解析 RGBA、拾取缓冲样本编号与锯齿对比。采样布局迁移版本为 <code>sample-layout-migration-v2-geometric-yx</code>（存储/schema v2）：旧设备序可按位置置换 owner/depth/mask；样点真正移位时必须用原几何重光栅，无几何则保留旧布局或拒绝转换。命令行 <code>npm run msaa</code> 仅作辅助证据/迁移检查，不替代图形入口。</p>
+      </div>
+      <div>
         <h3>边函数与共享边归属</h3>
         <p class="hint">W(A→B,P)=(B−A)×(P−A)。先把三角形规范化为 area2&gt;0，故翻转绕序结果不变。W&gt;0 在内；W=0 时仅当该规范边满足 <code>By&lt;Ay 或 (By=Ay 且 Bx&lt;Ax)</code>（向上边 / 水平从右向左的“顶/左”边）才收入。该谓词对 A/B 交换取反，因此共边样本恰好归属一个邻图元。</p>
       </div>
@@ -193,7 +198,7 @@ python3 -m http.server 8123
   </section>
 </main>
 
-<footer class="footer">Coverage kernel: js/coverage-core.js · analytic: js/analytic.js · reference: tools/reference.py · 127 项 node:test 一致性检查</footer>
+<footer class="footer">Coverage kernel: js/coverage-core.js · analytic: js/analytic.js · reference: tools/reference.py · 127 项核心一致性检查 + 9 项采样布局迁移测试</footer>
 
 <script src="js/coverage-core.js"></script>
 <script src="js/analytic.js"></script>
